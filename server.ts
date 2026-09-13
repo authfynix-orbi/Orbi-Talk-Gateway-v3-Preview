@@ -63,6 +63,14 @@ const SERVICE_VERSION = process.env.ORBI_TALK_GATEWAY_VERSION?.trim()
   || process.env.npm_package_version?.trim()
   || "0.0.0";
 
+const PAY_GATEWAY_DELIVERY_CALLBACK_URL = String(process.env.ORBI_PAY_NOTIFICATION_CALLBACK_URL || "").trim();
+const PAY_GATEWAY_DELIVERY_CALLBACK_SECRET = String(process.env.ORBI_PAY_NOTIFICATION_CALLBACK_SECRET || "").trim();
+const DELIVERY_CALLBACK_INTERVAL_MS = envInteger("ORBI_PAY_NOTIFICATION_CALLBACK_INTERVAL_MS", 30000, 5000);
+const callbackSignature = (body: Record<string, unknown>, timestamp: string, nonce: string) => { const stable=(v:any):string=>v==null?"":typeof v!=="object"?JSON.stringify(v):Array.isArray(v)?`[${v.map(stable).join(",")}]`:`{${Object.entries(v).filter(([,x])=>x!==undefined).sort(([a],[b])=>a.localeCompare(b)).map(([k,x])=>`${JSON.stringify(k)}:${stable(x)}`).join(",")}}`;const digest=crypto.createHash("sha256").update(stable(body)).digest("hex");return crypto.createHmac("sha256",PAY_GATEWAY_DELIVERY_CALLBACK_SECRET).update(`${timestamp}.${nonce}.${digest}`).digest("hex");};
+async function deliverPayGatewayCallback(payload:Record<string,unknown>){const timestamp=new Date().toISOString(),nonce=crypto.randomUUID();const response=await fetch(PAY_GATEWAY_DELIVERY_CALLBACK_URL,{method:"POST",headers:{"content-type":"application/json","x-orbi-talk-timestamp":timestamp,"x-orbi-talk-nonce":nonce,"x-orbi-talk-signature":`sha256=${callbackSignature(payload,timestamp,nonce)}`,"x-orbi-environment":String(process.env.ORBI_TALK_ENVIRONMENT||"live")},body:JSON.stringify(payload)});if(!response.ok)throw Error(`PAY_GATEWAY_CALLBACK_HTTP_${response.status}`);}
+async function enqueuePayGatewayDeliveryCallback(messageId:string,status:string,reason?:string){if(!PAY_GATEWAY_DELIVERY_CALLBACK_URL||PAY_GATEWAY_DELIVERY_CALLBACK_SECRET.length<32)return;const normalized=status==="delivered"?"delivered":status==="failed"?"failed":"";if(!normalized)return;const eventId=`talk_delivery_${crypto.createHash("sha256").update(`${messageId}:${normalized}`).digest("hex").slice(0,32)}`,payload={eventId,providerMessageId:messageId,status:normalized,...(reason?{reason:String(reason).slice(0,500)}:{})},adminApp=getFirebaseAdmin();if(!adminApp)return deliverPayGatewayCallback(payload);const ref=adminApp.firestore().collection("pay_gateway_delivery_callback_outbox").doc(eventId);try{await ref.create({payload,status:"pending",attempts:0,nextAttemptAt:admin.firestore.Timestamp.now(),createdAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});}catch(e:any){if(Number(e?.code)!==6&&String(e?.code)!=="already-exists")throw e;}}
+async function flushPayGatewayDeliveryCallbacks(){const adminApp=getFirebaseAdmin();if(!adminApp||!PAY_GATEWAY_DELIVERY_CALLBACK_URL)return;const snapshot=await adminApp.firestore().collection("pay_gateway_delivery_callback_outbox").where("status","==","pending").limit(50).get();for(const doc of snapshot.docs){const d=doc.data(),attempts=Number(d.attempts||0);if(d.nextAttemptAt?.toMillis?.()>Date.now())continue;try{await deliverPayGatewayCallback(d.payload||{});await doc.ref.update({status:"delivered",deliveredAt:admin.firestore.FieldValue.serverTimestamp(),updatedAt:admin.firestore.FieldValue.serverTimestamp()});}catch(e:any){await doc.ref.update({attempts:attempts+1,lastError:String(e?.message||e).slice(0,300),nextAttemptAt:admin.firestore.Timestamp.fromMillis(Date.now()+Math.min(3600,2**(attempts+1)*30)*1000),updatedAt:admin.firestore.FieldValue.serverTimestamp()});}}}
+
 let firestoreQuotaBackoffUntil = 0;
 let firestoreQuotaFailureCount = 0;
 
@@ -2266,6 +2274,7 @@ async function startServer() {
       }
       
       console.log(`Delivery report for ${messageId}: ${status}${error ? ` (${error})` : ""}`);
+      await enqueuePayGatewayDeliveryCallback(String(messageId), String(status), error ? String(error) : undefined);
       res.json({ success: true });
     } catch (err) {
       console.error("Error processing delivery report:", err);
@@ -4040,6 +4049,11 @@ async function startServer() {
   };
   if (AUTO_DISPATCH_ENABLED) {
     setInterval(runAutomaticQueueDispatch, AUTO_DISPATCH_INTERVAL_MS);
+  }
+
+  if (PAY_GATEWAY_DELIVERY_CALLBACK_URL && PAY_GATEWAY_DELIVERY_CALLBACK_SECRET.length >= 32) {
+    setInterval(() => void flushPayGatewayDeliveryCallbacks().catch((error) => console.error("[Pay Gateway Callback] flush failed:", error)), DELIVERY_CALLBACK_INTERVAL_MS);
+    void flushPayGatewayDeliveryCallbacks().catch((error) => console.error("[Pay Gateway Callback] startup flush failed:", error));
   }
 
   const keepAliveBaseUrl = resolveTalkGatewayBaseUrl();
